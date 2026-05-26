@@ -18,7 +18,7 @@ def test_amp_reward_uses_lsgan_quadratic_reward() -> None:
   reward.discriminator = _FixedDiscriminator()
 
   amp_obs = torch.zeros((3, 202))
-  actual = reward.compute_reward(amp_obs)
+  actual = reward.compute_reward(amp_obs, dt=1.0)
 
   expected = torch.tensor([2.0, 0.0, 0.0])
   torch.testing.assert_close(actual, expected)

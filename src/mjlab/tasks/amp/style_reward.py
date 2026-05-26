@@ -4,10 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from torch import optim
+from torch import autograd
 
 from mjlab.entity import Entity
-from mjlab.tasks.amp.components import AMPDiscriminator, AMPReplayBuffer
+from mjlab.tasks.amp.components import AMPDiscriminator
 from mjlab.tasks.amp.config import AmpStyleCfg
 from mjlab.tasks.amp.motion import AMP_KEY_BODY_NAMES, AMPMotionLibrary
 
@@ -63,6 +63,17 @@ def compute_amp_frame(
   )
 
 
+def gradient_penalty(discriminator: torch.nn.Module, demo_obs: torch.Tensor) -> torch.Tensor:
+  """Gradient penalty on demo observations.
+
+  Penalizes the discriminator for having large gradients w.r.t. demo inputs.
+  """
+  demo_obs = demo_obs.detach().requires_grad_(True)
+  logits = discriminator(demo_obs)
+  grad = autograd.grad(logits.sum(), demo_obs, create_graph=True)[0]
+  return grad.square().sum(dim=-1).mean()
+
+
 class AMPStyleReward:
   def __init__(
     self, env: ManagerBasedRlEnv, cfg: AmpStyleCfg, device: str | torch.device
@@ -91,22 +102,14 @@ class AMPStyleReward:
       (env.num_envs, self.history, self.frame_dim), device=device
     )
     self.discriminator = AMPDiscriminator(self.obs_dim).to(device)
-    self.optimizer = optim.AdamW(
-      self.discriminator.parameters(),
-      lr=cfg.learning_rate,
-      weight_decay=cfg.weight_decay,
-    )
-    self.replay = AMPReplayBuffer(cfg.replay_size, self.obs_dim, device)
 
   def state_dict(self) -> dict[str, object]:
     return {
       "discriminator": self.discriminator.state_dict(),
-      "optimizer": self.optimizer.state_dict(),
     }
 
   def load_state_dict(self, state: dict[str, object]) -> None:
     self.discriminator.load_state_dict(state["discriminator"])
-    self.optimizer.load_state_dict(state["optimizer"])
 
   def _body_indexes(self, body_names: list[str]) -> list[int]:
     sim_body_names = list(self.asset.body_names)
@@ -140,64 +143,18 @@ class AMPStyleReward:
     return self.obs_buffer.reshape(self.env.num_envs, self.obs_dim)
 
   @torch.no_grad()
-  def compute_reward(self, amp_obs: torch.Tensor) -> torch.Tensor:
+  def compute_reward(self, amp_obs: torch.Tensor, dt: float) -> torch.Tensor:
     logits = self.discriminator(amp_obs)
-    return (1.0 - 0.25 * (logits - 1.0).square()) * self.cfg.reward_scale
+    rew = (1.0 - 0.25 * (logits - 1.0).square()).clamp(min=0.0)
+    return rew * self.cfg.reward_scale * dt
 
-  def store_policy_observations(self, policy_amp_obs: torch.Tensor) -> None:
-    commands = self._commands()
-    self.replay.add(policy_amp_obs, commands)
-
-  def update_many(self, num_updates: int) -> dict[str, torch.Tensor]:
-    metrics = [self.update() for _ in range(num_updates)]
-    if not metrics:
-      zero = torch.tensor(0.0, device=self.device)
-      return self._metrics(zero, zero, zero, zero, zero, zero)
-    averaged = {
-      key: torch.stack([metric[key].detach() for metric in metrics]).mean()
-      for key in metrics[0]
-    }
-    averaged["AMP/disc_updates"] = torch.stack(
-      [metric["AMP/disc_updates"].detach() for metric in metrics]
-    ).sum()
-    return averaged
-
-  def update(self) -> dict[str, torch.Tensor]:
-    if self.replay.size < self.cfg.batch_size:
-      zero = torch.tensor(0.0, device=self.device)
-      return self._metrics(zero, zero, zero, zero, zero, zero)
-
-    with torch.inference_mode(False), torch.enable_grad():
-      policy_obs, policy_commands = self.replay.sample(self.cfg.batch_size)
-      demo_obs = self.collect_reference_motions(self.cfg.batch_size, policy_commands)
-      demo_logits = self.discriminator(demo_obs)
-      policy_logits = self.discriminator(policy_obs)
-      demo_loss = 0.5 * F.mse_loss(demo_logits, torch.ones_like(demo_logits))
-      policy_loss = 0.5 * F.mse_loss(policy_logits, -torch.ones_like(policy_logits))
-      reg_loss = self.cfg.logit_reg * (
-        demo_logits.square().mean() + policy_logits.square().mean()
-      )
-      grad_penalty = self.cfg.grad_penalty * self._gradient_penalty(demo_obs)
-      loss = demo_loss + policy_loss + reg_loss + grad_penalty
-      scaled_loss = self.cfg.loss_scale * loss
-
-      self.optimizer.zero_grad(set_to_none=True)
-      scaled_loss.backward()
-      self.optimizer.step()
-    return self._metrics(
-      loss.detach(),
-      scaled_loss.detach(),
-      demo_logits.detach().mean(),
-      policy_logits.detach().mean(),
-      self._demo_command_error(),
-      torch.tensor(1.0, device=self.device),
-    )
-
-  def collect_reference_motions(
-    self, num_samples: int, commands: torch.Tensor | None = None
-  ) -> torch.Tensor:
+  @torch.no_grad()
+  def compute_demo_obs(self, commands: torch.Tensor) -> torch.Tensor:
+    """Pre-compute discriminator demo observations for the current step."""
     dof_pos, dof_vel, body_pos, body_quat, body_lin_vel, body_ang_vel = (
-      self.motion.sample_reference(num_samples, self.history, self.frame_dt, commands)
+      self.motion.sample_reference(
+        self.env.num_envs, self.history, self.frame_dt, commands
+      )
     )
     frames = compute_amp_frame(
       dof_pos[:, self.dof_indexes],
@@ -208,21 +165,13 @@ class AMPStyleReward:
       body_ang_vel[:, self.motion.ref_body_index],
       body_pos[:, self.motion.key_body_indexes],
     )
-    return frames.view(num_samples, self.history, self.frame_dim).reshape(
-      num_samples, self.obs_dim
-    )
+    return frames.view(self.env.num_envs, self.obs_dim)
 
   def _commands(self) -> torch.Tensor:
     command = self.env.command_manager.get_command("twist")
     if command is None:
       return torch.zeros((self.env.num_envs, 3), device=self.device)
     return command[:, :3]
-
-  def _demo_command_error(self) -> torch.Tensor:
-    if self.motion.last_sampled_commands.numel() == 0:
-      return torch.tensor(0.0, device=self.device)
-    error = self.motion.last_sampled_commands - self.motion.last_target_commands
-    return torch.linalg.norm(error, dim=-1).mean()
 
   def _compute_sim_frame(self) -> torch.Tensor:
     data = self.asset.data
@@ -235,21 +184,3 @@ class AMPStyleReward:
       data.body_link_ang_vel_w[:, self.ref_body_index],
       data.body_link_pos_w[:, self.body_indexes],
     )
-
-  def _gradient_penalty(self, demo_obs: torch.Tensor) -> torch.Tensor:
-    demo_obs = demo_obs.detach().requires_grad_(True)
-    logits = self.discriminator(demo_obs)
-    grad = torch.autograd.grad(logits.sum(), demo_obs, create_graph=True)[0]
-    return grad.square().sum(dim=-1).mean()
-
-  def _metrics(
-    self, loss, scaled_loss, demo_score, policy_score, command_error, updates
-  ) -> dict[str, torch.Tensor]:
-    return {
-      "AMP/disc_loss": loss,
-      "AMP/disc_scaled_loss": scaled_loss,
-      "AMP/demo_score": demo_score,
-      "AMP/policy_score": policy_score,
-      "AMP/demo_command_error": command_error,
-      "AMP/disc_updates": updates,
-    }

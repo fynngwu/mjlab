@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class AmpStyleCfg:
   motion_path: str
   reward_weight: float = 1.0
-  reward_scale: float = 2.0
+  reward_scale: float = 5.0
   loss_scale: float = 5.0
   history: int = 2
   batch_size: int = 4096
@@ -16,3 +16,4 @@ class AmpStyleCfg:
   weight_decay: float = 1.0e-4
   logit_reg: float = 0.05
   grad_penalty: float = 5.0
+  disc_obs_buffer_size: int = 48
