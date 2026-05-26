@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -17,8 +18,18 @@ _AMP_STYLE_REWARDS = (
 
 
 def _amp_motion_path() -> str:
-  repo_root = Path(__file__).resolve().parents[7]
-  return str(repo_root / "src/holosoma/holosoma/data/motions/g1_29dof/amp/walk_and_run")
+  relative_path = Path("holosoma/holosoma/data/motions/g1_29dof/amp/walk_and_run")
+  repo_root = Path(__file__).resolve().parents[6]
+  candidates = (
+    os.environ.get("MJLAB_AMP_MOTION_PATH"),
+    repo_root / "data/motions/g1_29dof/amp/walk_and_run",
+    repo_root.parent / "src" / relative_path,
+    repo_root.parent / "holosoma/src" / relative_path,
+  )
+  for candidate in candidates:
+    if candidate is not None and Path(candidate).exists():
+      return str(candidate)
+  return str(repo_root / "data/motions/g1_29dof/amp/walk_and_run")
 
 
 def unitree_g1_flat_amp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
