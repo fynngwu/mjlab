@@ -19,6 +19,8 @@ AMP_KEY_BODY_NAMES = [
   "left_ankle_roll_link",
 ]
 
+COMMAND_BUCKET_RESOLUTION = 0.3
+
 
 @dataclass
 class AMPMotion:
@@ -33,6 +35,7 @@ class AMPMotion:
   body_quat_wxyz: torch.Tensor
   body_lin_vel: torch.Tensor
   body_ang_vel: torch.Tensor
+  frame_commands: torch.Tensor
 
   @property
   def dt(self) -> float:
@@ -55,6 +58,7 @@ class AMPMotionLibrary:
     self.ref_body_index = self.get_body_index(["pelvis"])[0]
     self.dt = 1.0 / self.motions[0].fps
     self.motion_commands = torch.stack([m.command for m in self.motions]).to(device)
+    self._build_command_buckets()
     self.last_sampled_commands = torch.empty((0, 3), device=device)
     self.last_target_commands = torch.empty((0, 3), device=device)
 
@@ -72,6 +76,7 @@ class AMPMotionLibrary:
   def _load_motion(self, path: Path) -> AMPMotion:
     data = np.load(path, allow_pickle=True)
     command = data["motion_command"] if "motion_command" in data else np.zeros(3)
+    frame_commands = self._load_frame_commands(data, command)
     return AMPMotion(
       name=path.name,
       fps=float(np.asarray(data["fps"]).reshape(-1)[0]),
@@ -90,7 +95,21 @@ class AMPMotionLibrary:
       body_ang_vel=torch.as_tensor(
         data["body_angular_velocities"], device=self.device
       ).float(),
+      frame_commands=torch.as_tensor(
+        frame_commands, device=self.device, dtype=torch.float
+      ),
     )
+
+  def _load_frame_commands(
+    self, data: np.lib.npyio.NpzFile, fallback_command: np.ndarray
+  ) -> np.ndarray:
+    if "root_linear_velocities_base" not in data or "root_yaw_rates" not in data:
+      frame_count = data["dof_positions"].shape[0]
+      command = np.asarray(fallback_command, dtype=np.float32)[None]
+      return np.repeat(command, frame_count, axis=0)
+    root_lin_vel_b = np.asarray(data["root_linear_velocities_base"], dtype=np.float32)
+    root_yaw_rate = np.asarray(data["root_yaw_rates"], dtype=np.float32).reshape(-1, 1)
+    return np.concatenate((root_lin_vel_b[:, :2], root_yaw_rate), axis=1)
 
   def _validate_motion_contract(self) -> None:
     expected_bodies = ["pelvis", *AMP_KEY_BODY_NAMES]
@@ -107,12 +126,47 @@ class AMPMotionLibrary:
         raise ValueError(f"{motion.name}: AMP body_names differ")
       if abs(motion.fps - self.motions[0].fps) > 1.0e-3:
         raise ValueError(f"{motion.name}: AMP fps differs")
+      if motion.frame_commands.shape != (motion.dof_pos.shape[0], 3):
+        raise ValueError(
+          f"{motion.name}: AMP frame_commands must have shape "
+          f"({motion.dof_pos.shape[0]}, 3), got {motion.frame_commands.shape}"
+        )
 
   def get_dof_index(self, dof_names: list[str]) -> list[int]:
     return [self.dof_names.index(name) for name in dof_names]
 
   def get_body_index(self, body_names: list[str]) -> list[int]:
     return [self.body_names.index(name) for name in body_names]
+
+  def _build_command_buckets(self) -> None:
+    motion_ids = []
+    frame_ids = []
+    frame_commands = []
+    for motion_id, motion in enumerate(self.motions):
+      num_frames = motion.dof_pos.shape[0]
+      motion_ids.append(
+        torch.full((num_frames,), motion_id, device=self.device, dtype=torch.long)
+      )
+      frame_ids.append(torch.arange(num_frames, device=self.device, dtype=torch.long))
+      frame_commands.append(motion.frame_commands)
+    self._frame_motion_ids = torch.cat(motion_ids)
+    self._frame_ids = torch.cat(frame_ids)
+    self._frame_commands = torch.cat(frame_commands)
+
+    bucket_ids = self._bucketize_commands(self._frame_commands).cpu().tolist()
+    bucket_to_indexes: dict[tuple[int, int, int], list[int]] = {}
+    for index, bucket in enumerate(bucket_ids):
+      bucket_to_indexes.setdefault(tuple(bucket), []).append(index)
+    self._bucket_keys = torch.tensor(
+      list(bucket_to_indexes), device=self.device, dtype=torch.long
+    )
+    self._bucket_frame_indexes = [
+      torch.tensor(indexes, device=self.device, dtype=torch.long)
+      for indexes in bucket_to_indexes.values()
+    ]
+
+  def _bucketize_commands(self, commands: torch.Tensor) -> torch.Tensor:
+    return torch.round(commands[:, :3] / COMMAND_BUCKET_RESOLUTION).long()
 
   def sample_reference(
     self,
@@ -121,15 +175,11 @@ class AMPMotionLibrary:
     frame_dt: float,
     commands: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, ...]:
-    motion_ids = self._sample_motion_ids(num_samples, commands)
-    current_times = torch.empty(num_samples, device=self.device)
-    for motion_id, motion in enumerate(self.motions):
-      mask = motion_ids == motion_id
-      if mask.any():
-        current_times[mask] = (
-          torch.rand(mask.sum(), device=self.device) * motion.duration
-        )
-    self.last_sampled_commands = self.motion_commands[motion_ids]
+    motion_ids, frame_ids, frame_commands = self._sample_frame_refs(
+      num_samples, commands
+    )
+    current_times = frame_ids.float() * self.dt
+    self.last_sampled_commands = frame_commands
     self.last_target_commands = (
       torch.zeros_like(self.last_sampled_commands)
       if commands is None
@@ -141,16 +191,43 @@ class AMPMotionLibrary:
       (current_times[:, None] - offsets).flatten(),
     )
 
-  def _sample_motion_ids(
+  def _sample_frame_refs(
     self, num_samples: int, commands: torch.Tensor | None
-  ) -> torch.Tensor:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if commands is None:
-      return torch.randint(len(self.motions), (num_samples,), device=self.device)
+      frame_indexes = torch.randint(
+        self._frame_ids.numel(), (num_samples,), device=self.device
+      )
+      return (
+        self._frame_motion_ids[frame_indexes],
+        self._frame_ids[frame_indexes],
+        self._frame_commands[frame_indexes],
+      )
     target = commands[:, :3].to(device=self.device, dtype=torch.float)
-    scale = torch.tensor([0.5, 0.5, 0.75], device=self.device)
-    diff = (target[:, None, :] - self.motion_commands[None, :, :]) / scale
-    weights = torch.softmax(-diff.square().sum(dim=-1), dim=-1)
-    return torch.multinomial(weights, 1).squeeze(1)
+    bucket_indexes = self._resolve_bucket_indexes(self._bucketize_commands(target))
+    frame_indexes = torch.empty(num_samples, device=self.device, dtype=torch.long)
+    for bucket_index in torch.unique(bucket_indexes).tolist():
+      mask = bucket_indexes == bucket_index
+      candidates = self._bucket_frame_indexes[bucket_index]
+      choices = torch.randint(
+        candidates.numel(), (int(mask.sum()),), device=self.device
+      )
+      frame_indexes[mask] = candidates[choices]
+    return (
+      self._frame_motion_ids[frame_indexes],
+      self._frame_ids[frame_indexes],
+      self._frame_commands[frame_indexes],
+    )
+
+  def _resolve_bucket_indexes(self, target_buckets: torch.Tensor) -> torch.Tensor:
+    matches = (target_buckets[:, None, :] == self._bucket_keys[None, :, :]).all(dim=-1)
+    has_exact_match = matches.any(dim=-1)
+    exact_indexes = matches.float().argmax(dim=-1)
+    bucket_dist = (
+      target_buckets[:, None, :] - self._bucket_keys[None, :, :]
+    ).square().sum(dim=-1)
+    nearest_indexes = bucket_dist.argmin(dim=-1)
+    return torch.where(has_exact_match, exact_indexes, nearest_indexes)
 
   def sample(
     self, motion_ids: torch.Tensor, times: torch.Tensor
