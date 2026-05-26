@@ -4,9 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from torch import nn, optim
+from torch import optim
 
 from mjlab.entity import Entity
+from mjlab.tasks.amp.components import AMPDiscriminator, AMPReplayBuffer
 from mjlab.tasks.amp.config import AmpStyleCfg
 from mjlab.tasks.amp.motion import AMP_KEY_BODY_NAMES, AMPMotionLibrary
 
@@ -60,58 +61,6 @@ def compute_amp_frame(
     ),
     dim=-1,
   )
-
-
-class AMPDiscriminator(nn.Module):
-  def __init__(self, obs_dim: int):
-    super().__init__()
-    self.net = nn.Sequential(
-      nn.Linear(obs_dim, 1024),
-      nn.LeakyReLU(0.2),
-      nn.Linear(1024, 512),
-      nn.LeakyReLU(0.2),
-      nn.Linear(512, 1),
-    )
-
-  def forward(self, obs: torch.Tensor) -> torch.Tensor:
-    return self.net(obs).squeeze(-1)
-
-
-class AMPReplayBuffer:
-  def __init__(self, capacity: int, obs_dim: int, device: str | torch.device):
-    self.obs = torch.empty((capacity, obs_dim), device=device)
-    self.commands = torch.empty((capacity, 3), device=device)
-    self.capacity = capacity
-    self.ptr = 0
-    self.size = 0
-    self.device = device
-
-  def add(self, obs: torch.Tensor, commands: torch.Tensor) -> None:
-    obs = obs.detach()
-    commands = commands[:, :3].detach()
-    count = obs.shape[0]
-    if count >= self.capacity:
-      self.obs[:] = obs[-self.capacity :]
-      self.commands[:] = commands[-self.capacity :]
-      self.ptr = 0
-      self.size = self.capacity
-      return
-    end = self.ptr + count
-    if end <= self.capacity:
-      self.obs[self.ptr : end] = obs
-      self.commands[self.ptr : end] = commands
-    else:
-      first = self.capacity - self.ptr
-      self.obs[self.ptr :] = obs[:first]
-      self.commands[self.ptr :] = commands[:first]
-      self.obs[: end % self.capacity] = obs[first:]
-      self.commands[: end % self.capacity] = commands[first:]
-    self.ptr = end % self.capacity
-    self.size = min(self.size + count, self.capacity)
-
-  def sample(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    indexes = torch.randint(self.size, (batch_size,), device=self.device)
-    return self.obs[indexes], self.commands[indexes]
 
 
 class AMPStyleReward:
@@ -198,12 +147,28 @@ class AMPStyleReward:
       * self.cfg.reward_scale
     )
 
-  def update(self, policy_amp_obs: torch.Tensor) -> dict[str, torch.Tensor]:
+  def store_policy_observations(self, policy_amp_obs: torch.Tensor) -> None:
     commands = self._commands()
     self.replay.add(policy_amp_obs, commands)
+
+  def update_many(self, num_updates: int) -> dict[str, torch.Tensor]:
+    metrics = [self.update() for _ in range(num_updates)]
+    if not metrics:
+      zero = torch.tensor(0.0, device=self.device)
+      return self._metrics(zero, zero, zero, zero, zero, zero)
+    averaged = {
+      key: torch.stack([metric[key].detach() for metric in metrics]).mean()
+      for key in metrics[0]
+    }
+    averaged["AMP/disc_updates"] = torch.stack(
+      [metric["AMP/disc_updates"].detach() for metric in metrics]
+    ).sum()
+    return averaged
+
+  def update(self) -> dict[str, torch.Tensor]:
     if self.replay.size < self.cfg.batch_size:
       zero = torch.tensor(0.0, device=self.device)
-      return self._metrics(zero, zero, zero, zero)
+      return self._metrics(zero, zero, zero, zero, zero, zero)
 
     with torch.inference_mode(False), torch.enable_grad():
       policy_obs, policy_commands = self.replay.sample(self.cfg.batch_size)
@@ -221,15 +186,18 @@ class AMPStyleReward:
       )
       grad_penalty = self.cfg.grad_penalty * self._gradient_penalty(demo_obs)
       loss = demo_loss + policy_loss + reg_loss + grad_penalty
+      scaled_loss = self.cfg.loss_scale * loss
 
       self.optimizer.zero_grad(set_to_none=True)
-      loss.backward()
+      scaled_loss.backward()
       self.optimizer.step()
     return self._metrics(
       loss.detach(),
+      scaled_loss.detach(),
       torch.sigmoid(demo_logits.detach()).mean(),
       torch.sigmoid(policy_logits.detach()).mean(),
       self._demo_command_error(),
+      torch.tensor(1.0, device=self.device),
     )
 
   def collect_reference_motions(
@@ -282,11 +250,13 @@ class AMPStyleReward:
     return grad.square().sum(dim=-1).mean()
 
   def _metrics(
-    self, loss, demo_score, policy_score, command_error
+    self, loss, scaled_loss, demo_score, policy_score, command_error, updates
   ) -> dict[str, torch.Tensor]:
     return {
       "AMP/disc_loss": loss,
+      "AMP/disc_scaled_loss": scaled_loss,
       "AMP/demo_score": demo_score,
       "AMP/policy_score": policy_score,
       "AMP/demo_command_error": command_error,
+      "AMP/disc_updates": updates,
     }

@@ -37,7 +37,6 @@ def unitree_g1_flat_amp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.scene.num_envs = 4096
   cfg.amp_style = AmpStyleCfg(
     motion_path=_amp_motion_path(),
-    reward_weight=5.0,
   )
 
   for reward_name in _AMP_STYLE_REWARDS:
