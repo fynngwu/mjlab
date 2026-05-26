@@ -142,3 +142,13 @@ def test_play_mode_disables_push_robot(all_task_ids: list[str]) -> None:
     assert "push_robot" not in cfg.events, (
       f"Play mode task {task_id} has push_robot event, expected it to be removed"
     )
+
+
+def test_amp_g1_terminates_low_base_with_penalty() -> None:
+  """AMP G1 should terminate when the root is below the lying-down height."""
+  cfg = load_env_cfg("Mjlab-Velocity-Flat-Unitree-G1-AMP")
+
+  assert "base_height" in cfg.terminations
+  assert cfg.terminations["base_height"].params["minimum_height"] == 0.2
+  assert "termination" in cfg.rewards
+  assert cfg.rewards["termination"].weight == -50.0

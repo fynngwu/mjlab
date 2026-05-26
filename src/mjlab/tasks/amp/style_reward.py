@@ -142,10 +142,7 @@ class AMPStyleReward:
   @torch.no_grad()
   def compute_reward(self, amp_obs: torch.Tensor) -> torch.Tensor:
     logits = self.discriminator(amp_obs)
-    return (
-      -torch.log(torch.clamp(1.0 - torch.sigmoid(logits), min=1.0e-4))
-      * self.cfg.reward_scale
-    )
+    return (1.0 - 0.25 * (logits - 1.0).square()) * self.cfg.reward_scale
 
   def store_policy_observations(self, policy_amp_obs: torch.Tensor) -> None:
     commands = self._commands()
@@ -175,12 +172,8 @@ class AMPStyleReward:
       demo_obs = self.collect_reference_motions(self.cfg.batch_size, policy_commands)
       demo_logits = self.discriminator(demo_obs)
       policy_logits = self.discriminator(policy_obs)
-      demo_loss = F.binary_cross_entropy_with_logits(
-        demo_logits, torch.ones_like(demo_logits)
-      )
-      policy_loss = F.binary_cross_entropy_with_logits(
-        policy_logits, torch.zeros_like(policy_logits)
-      )
+      demo_loss = 0.5 * F.mse_loss(demo_logits, torch.ones_like(demo_logits))
+      policy_loss = 0.5 * F.mse_loss(policy_logits, -torch.ones_like(policy_logits))
       reg_loss = self.cfg.logit_reg * (
         demo_logits.square().mean() + policy_logits.square().mean()
       )
@@ -194,8 +187,8 @@ class AMPStyleReward:
     return self._metrics(
       loss.detach(),
       scaled_loss.detach(),
-      torch.sigmoid(demo_logits.detach()).mean(),
-      torch.sigmoid(policy_logits.detach()).mean(),
+      demo_logits.detach().mean(),
+      policy_logits.detach().mean(),
       self._demo_command_error(),
       torch.tensor(1.0, device=self.device),
     )
