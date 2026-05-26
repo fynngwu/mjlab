@@ -162,6 +162,9 @@ class ManagerBasedRlEnvCfg:
   algorithms that expect unscaled reward signals (e.g., HER, static reward scaling).
   """
 
+  amp_style: Any | None = None
+  """Optional AMP style-reward configuration consumed by AMP runner wrappers."""
+
 
 class ManagerBasedRlEnv:
   """Manager-based RL environment."""
